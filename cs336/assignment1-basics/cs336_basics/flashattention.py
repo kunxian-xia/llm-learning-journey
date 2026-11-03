@@ -86,7 +86,6 @@ class FlashAttentionTorch(torch.autograd.Function):
         raise NotImplementedError()
 
 
-# TODO: handle causal attention
 @triton.jit
 def flash_attention_fwd_kernel(
     # fmt: off
@@ -163,7 +162,14 @@ def flash_attention_fwd_kernel(
 
     q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
 
-    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    n_key_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    if is_causal:
+        n_key_tiles = tl.minimum(
+            n_key_tiles,
+            tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE),
+        )
+
+    for i in range(n_key_tiles):
         k_start = i * K_TILE_SIZE
         # load k, v
         k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
