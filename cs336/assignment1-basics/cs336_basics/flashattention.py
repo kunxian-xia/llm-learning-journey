@@ -8,6 +8,10 @@ class FlashAttentionTorch(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, is_causal):
+        if is_causal:
+            # TODO: fix this
+            raise NotImplementedError()
+
         # implement the forward pass of vanilla attention
         # using the flash attention algorithm, but using only
         # standard PyTorch operations (no Triton!)
@@ -76,6 +80,7 @@ class FlashAttentionTorch(torch.autograd.Function):
             Out[..., q_start:q_end, :] = o / l.unsqueeze(-1)
             Logsumexp[..., q_start:q_end] = m + torch.log(l)
 
+        ctx.is_causal = is_causal
         ctx.save_for_backward(q, k, v, Out, Logsumexp)
 
         # 3. return tensor O
@@ -83,7 +88,96 @@ class FlashAttentionTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        raise NotImplementedError()
+        q, k, v, Out, Logsumexp = ctx.saved_tensors
+        is_causal = ctx.is_causal
+
+        tile_size = 32
+        scale = 1 / math.sqrt(q.shape[-1])
+
+        # Li = log(\sum_j exp(S_{ij}))
+        num_keys = k.shape[-2]
+        num_queries = q.shape[-2]
+
+        num_q_tiles = (num_queries + tile_size - 1) // tile_size
+        num_k_tiles = (num_keys + tile_size - 1) // tile_size
+
+        dV = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
+        dK = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
+        dQ = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+
+        for j in range(num_k_tiles):
+            k_start = j * tile_size
+            k_end = min((j + 1) * tile_size, num_keys)
+
+            k_tile = k[..., k_start:k_end, :]
+
+            for i in range(num_q_tiles):
+                q_start = i * tile_size
+                q_end = min((i + 1) * tile_size, num_queries)
+
+                dO = grad_output[..., q_start:q_end, :]
+                q_tile = q[..., q_start:q_end, :]
+                Li = Logsumexp[..., q_start:q_end]
+
+                # P_{ij} = exp(S_{ij} - Li)
+                Sij = torch.einsum("... q d, ... k d -> ... q k", q_tile, k_tile * scale)
+                Pij = torch.exp(Sij - Li.unsqueeze(-1))
+
+                # dV_{ja} += \sum_i P_ij * dO_ia
+                # j is the key dimension, a is the feature dimension
+                dVj = torch.einsum("... i j, ... i a -> ... j a", Pij, dO)
+                dV[..., k_start:k_end, :] += dVj
+
+                # dP = dO * V^T
+                # dPij = \sum_a dO_ia * V_ja
+                dPij = torch.einsum("... i a, ... j a -> ... i j", dO, v[..., k_start:k_end, :])
+
+                # D_i = rowsum(dO_i ⊙ O_i)
+                Di = torch.sum(dO * Out[..., q_start:q_end, :], dim=-1)
+
+                # dS_{ij} = P_{i,j} * (dP_{i,j} - D_i)
+                dSij = Pij * (dPij - Di.unsqueeze(-1))
+
+                # dK
+                # dK_{ja} += \sum_i (dS_ij) * Q_ia * scale
+                dKj = torch.einsum("... i j, ... i a -> ... j a", dSij, q_tile * scale)
+                dK[..., k_start:k_end, :] += dKj
+
+        # TODO: dQ = dS * K * scale
+        for i in range(num_q_tiles):
+            q_start = i * tile_size
+            q_end = min((i + 1) * tile_size, num_queries)
+
+            q_tile = q[..., q_start:q_end, :]
+            Li = Logsumexp[..., q_start:q_end]
+
+            # D_i = rowsum(dO_i ⊙ O_i)
+            dO = grad_output[..., q_start:q_end, :]
+            Di = torch.sum(dO * Out[..., q_start:q_end, :], dim=-1)
+
+            for j in range(num_k_tiles):
+                k_start = j * tile_size
+                k_end = min((j + 1) * tile_size, num_keys)
+
+                k_tile = k[..., k_start:k_end, :]
+
+                # P_{ij} = exp(S_{ij} - Li)
+                Sij = torch.einsum("... q d, ... k d -> ... q k", q_tile, k_tile * scale)
+                Pij = torch.exp(Sij - Li.unsqueeze(-1))
+
+                # dP = dO * V^T
+                # dPij = \sum_a dO_ia * V_ja
+                dPij = torch.einsum("... i a, ... j a -> ... i j", dO, v[..., k_start:k_end, :])
+
+                # dS_{ij} = P_{i,j} * (dP_{i,j} - D_i)
+                dSij = Pij * (dPij - Di.unsqueeze(-1))
+
+                # dQ_{ia} = \sum_j dSij * Kja * scale
+                dQ[..., q_start:q_end, :] += torch.einsum(
+                    "... i j, ... j a -> ... i a", dSij * scale, k[..., k_start:k_end, :]
+                )
+
+        return dQ, dK, dV, None
 
 
 @triton.jit
@@ -165,8 +259,7 @@ def flash_attention_fwd_kernel(
     n_key_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
     if is_causal:
         n_key_tiles = tl.minimum(
-            n_key_tiles,
-            tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE),
+            n_key_tiles, tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE)
         )
 
     for i in range(n_key_tiles):
