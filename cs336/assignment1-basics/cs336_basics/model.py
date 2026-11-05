@@ -146,14 +146,14 @@ class Attention(nn.Module):
         # v is tensor with shape (... keys d_v)
         # mask is tensor with shape (... queries keys)
 
-        qk = einsum(q, k, "... queries d_k, ... keys d_k -> ... queries keys")
+        attn_score = einsum(q, k, "... queries d_k, ... keys d_k -> ... queries keys")
 
         dk = q.size(-1)
-        qk = qk / sqrt(dk)
+        attn_score /= sqrt(dk)
 
         # tensor with shape (... queries keys)
-        masked_qk = qk.masked_fill(~mask, float("-inf"))
-        alpha = softmax(masked_qk, -1)
+        masked_attn_score = attn_score.masked_fill(~mask, float("-inf"))
+        alpha = softmax(masked_attn_score, -1)
 
         # returned tensor is of shape (... queries d_v)
         return einsum(alpha, v, "... queries keys, ... keys d_v -> ... queries d_v")
@@ -366,9 +366,7 @@ class TransformerBlock(nn.Module):
         seq_len = x.size(-2)
 
         token_positions = torch.arange(
-            seq_len,
-            device=x.device,
-            dtype=torch.long,
+            seq_len, device=x.device, dtype=torch.long
         ).expand(*x.shape[:-1])
 
         t1 = self.ln1(x)
@@ -403,10 +401,7 @@ class TransformerLM(nn.Module):
             in_features=d_model, out_features=vocab_size, device=device, dtype=dtype
         )
         self.token_embeddings = Embedding(
-            num_embeddings=vocab_size,
-            embedding_dim=d_model,
-            device=device,
-            dtype=dtype,
+            num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype
         )
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList(
