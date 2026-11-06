@@ -27,6 +27,10 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, gpu]
     timeout-minutes: 30
+    env:
+      # Keep downloaded wheels across jobs on the runner-work Docker volume.
+      UV_CACHE_DIR: /home/runner/_work/_uv_cache
+      TRITON_CACHE_DIR: /home/runner/_work/_triton_cache
     defaults:
       run:
         working-directory: cs336/assignment2-systems
@@ -40,8 +44,7 @@ jobs:
         with:
           working-directory: cs336/assignment2-systems
           python-version: "3.12"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          enable-cache: false
 
       - name: Verify CUDA and GPU availability
         run: |
@@ -57,4 +60,4 @@ jobs:
           PY
 
       - name: Run pytest (flash attention)
-        run: uv run --frozen pytest tests/test_attention.py 
+        run: uv run --frozen pytest tests/test_attention.py --durations=10
