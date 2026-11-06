@@ -1,0 +1,2 @@
+implementation,sequence_length,dimension,status,forward_ms,backward_ms,allocated_before_backward_mib,saved_after_forward_mib,peak_forward_mib,repetitions,gpu,error
+flash_torch,4096,64,ok,7395.9734,18599.4503,56.38,8.12,56.75,1,NVIDIA GeForce RTX 3090,
