@@ -414,6 +414,8 @@ def flash_attention_bwd_dq_kernel(
     O_tile = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
     Di = tl.sum(dO_tile * O_tile, axis=1)
 
+    q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
     for i in range(num_key_tiles):
         k_tile = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         v_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
@@ -423,8 +425,9 @@ def flash_attention_bwd_dq_kernel(
 
         k_start = i * K_TILE_SIZE
         k_offsets = k_start + tl.arange(0, K_TILE_SIZE)
-        attn_score = tl.where(k_offsets[None, :] < N_KEYS, attn_score, float("-inf"))
-        # TODO: handle causal masking
+        if is_causal:
+            valid_k = (k_offsets[None, :] < N_KEYS) & (k_offsets[None, :] <= q_offsets[:, None])
+            attn_score = tl.where(valid_k, attn_score, float("-inf"))
 
         # Pij = exp(Sij - Li)
         Pij = tl.exp(attn_score - L[:, None])
@@ -550,6 +553,7 @@ def flash_attention_bwd_dkdv_kernel(
     v_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
     dK = tl.zeros_like(k_tile)
     dV = tl.zeros_like(v_tile)
+    k_offsets = tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
 
     # iter over all query tiles for one key tile due to the fact that
     # dK relies on dS^T and dV relies on P^T
@@ -563,10 +567,14 @@ def flash_attention_bwd_dkdv_kernel(
         O_tile = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
         dO_tile = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        # TODO: handle causal masking
-
         # Sij = (q * k^T) / sqrt(d)
         Sij = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * scale
+
+        q_offsets = q_start + tl.arange(0, Q_TILE_SIZE)
+        if is_causal:
+            # k > q, then set to -inf
+            valid_q = (q_offsets[:, None] >= k_offsets[None, :]) & (q_offsets[:, None] < N_QUERIES)
+            Sij = tl.where(valid_q, Sij, float("-inf"))
 
         # Pij = exp(Sij - Li)
         Pij = tl.exp(Sij - L[:, None])
