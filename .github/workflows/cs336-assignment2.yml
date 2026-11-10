@@ -61,3 +61,115 @@ jobs:
 
       - name: Run pytest (flash attention)
         run: uv run --frozen pytest tests/test_attention.py --durations=10
+
+  benchmark:
+    name: Benchmark (Python 3.12)
+    # Same-repository branches are trusted; fork PRs must not reach this runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+    outputs:
+      report: ${{ steps.benchmark-report.outputs.markdown }}
+    env:
+      UV_CACHE_DIR: /home/runner/_work/_uv_cache
+    defaults:
+      run:
+        working-directory: cs336/assignment2-systems
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          working-directory: cs336/assignment2-systems
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Run benchmarks and build report
+        id: benchmark-report
+        run: |
+          set -euo pipefail
+          nvidia-smi
+          report="$RUNNER_TEMP/assignment2-benchmark.md"
+          gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
+          {
+            echo '<!-- cs336-assignment2-benchmark -->'
+            echo '### Assignment 2 benchmark'
+            echo
+            printf 'GPU: %s. Model: small. Batch size: 32. Context length: 256. Five warmups and ten measured calls per workload.\n\n' "$gpu_name"
+            echo '| Workload | Average time (s) |'
+            echo '| --- | ---: |'
+          } > "$report"
+          for workload in forward forward_backward full; do
+            output=$(uv run --frozen python bin/benchmark.py \
+              --hyperparam bin/hyperparam.json \
+              --model_size small \
+              --corpus_path ../assignment1-basics/data/tinystories_valid_token.bin \
+              --device cuda \
+              --workload "$workload" \
+              --warmup_steps 5)
+            printf '%s\n' "$output"
+            average=$(printf '%s\n' "$output" | sed -n "s/^average $workload pass .*: \([0-9][0-9.]*\)s$/\1/p")
+            test -n "$average"
+            printf '| %s | %s |\n' "$workload" "$average" >> "$report"
+          done
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo 'markdown<<BENCHMARK_REPORT_END'
+            cat "$report"
+            echo 'BENCHMARK_REPORT_END'
+          } >> "$GITHUB_OUTPUT"
+
+  benchmark-comment:
+    name: Comment benchmark on PR
+    needs: benchmark
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Post or update benchmark comment
+        uses: actions/github-script@v8
+        env:
+          BENCHMARK_REPORT: ${{ needs.benchmark.outputs.report }}
+        with:
+          script: |
+            const body = process.env.BENCHMARK_REPORT;
+            const marker = '<!-- cs336-assignment2-benchmark -->';
+            const { owner, repo } = context.repo;
+            let issue_number = context.issue.number;
+            if (!issue_number) {
+              const pulls = await github.paginate(
+                github.rest.repos.listPullRequestsAssociatedWithCommit,
+                { owner, repo, commit_sha: context.sha, per_page: 100 }
+              );
+              const pull = pulls.find(pr =>
+                pr.state === 'open' &&
+                pr.head.sha === context.sha &&
+                pr.head.repo?.full_name === owner + '/' + repo
+              );
+              if (!pull) {
+                core.info('No open pull request for this commit');
+                return;
+              }
+              issue_number = pull.number;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const previous = comments.find(comment =>
+              comment.user?.login === 'github-actions[bot]' &&
+              comment.body?.includes(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: previous.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body
+              });
+            }
