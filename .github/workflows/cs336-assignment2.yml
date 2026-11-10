@@ -125,7 +125,7 @@ jobs:
   benchmark-comment:
     name: Comment benchmark on PR
     needs: benchmark
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -141,7 +141,23 @@ jobs:
             const body = process.env.BENCHMARK_REPORT;
             const marker = '<!-- cs336-assignment2-benchmark -->';
             const { owner, repo } = context.repo;
-            const issue_number = context.issue.number;
+            let issue_number = context.issue.number;
+            if (!issue_number) {
+              const pulls = await github.paginate(
+                github.rest.repos.listPullRequestsAssociatedWithCommit,
+                { owner, repo, commit_sha: context.sha, per_page: 100 }
+              );
+              const pull = pulls.find(pr =>
+                pr.state === 'open' &&
+                pr.head.sha === context.sha &&
+                pr.head.repo?.full_name === owner + '/' + repo
+              );
+              if (!pull) {
+                core.info('No open pull request for this commit');
+                return;
+              }
+              issue_number = pull.number;
+            }
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number, per_page: 100
             });
