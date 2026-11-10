@@ -3,6 +3,7 @@ import torch
 from math import sqrt, cos, sin, pow
 from .utils import softmax
 from einops import einsum, rearrange
+from .flashattention import FlashAttentionTriton
 
 
 class Linear(nn.Module):
@@ -322,13 +323,17 @@ class MultiHeadSelfAttentionWithROPE(MultiHeadSelfAttention):
             num_heads=self.num_heads,
         )
 
-        causal_mask = torch.tril(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=bool)
-        )
-        att = Attention()
+        if x.is_cuda:
+            heads = FlashAttentionTriton.apply(qi, ki, vi, True)
+        else:
+            # without cuda, fall back to the vanilla implementation of attention
+            causal_mask = torch.tril(
+                torch.ones(seq_len, seq_len, device=x.device, dtype=bool)
+            )
+            att = Attention()
+            heads = att(qi, ki, vi, causal_mask)
 
-        # the tensor has shape (... num_heads seq_len d_v)
-        heads = att(qi, ki, vi, causal_mask)
+        # the tensor `heads` has shape (... num_heads seq_len d_v)
         heads = rearrange(
             heads, "... num_heads seq_len d_v -> ... seq_len (num_heads d_v)"
         )

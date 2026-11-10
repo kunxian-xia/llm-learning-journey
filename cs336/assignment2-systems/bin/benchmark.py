@@ -50,7 +50,7 @@ def main(args):
     # TODO: make context_length, vocab_size, batch_size configurable in hyperparam file
     context_length = 256
     vocab_size = 10000
-    batch_size = 32
+    batch_size = args.batch_size
 
     # 2. load model and optimizer from hyperparameters
     model_param = hyperparam[args.model_size]["model"]
@@ -121,6 +121,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--warmup_steps", type=int, default=10, help="number of warmup steps"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=32, help="batch size for benchmark"
     )
     parser.add_argument(
         "--device",

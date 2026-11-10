@@ -607,16 +607,20 @@ def flash_attention_bwd_dkdv_kernel(
 
 
 class FlashAttentionTriton(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, q, k, v, is_causal):
         #######################################################################
         #### implement the forward pass of flash attention using Triton kernels
         #######################################################################
 
-        # assumes q, k, v of shape (b, n, d)
-        assert len(q.shape) == len(k.shape) == len(v.shape) == 3
+        # assumes q, k, v of shape (..., n, d)
+        assert len(q.shape) == len(k.shape) == len(v.shape)
+        assert len(q.shape) >= 3
         assert q.shape[0] == k.shape[0] == v.shape[0]
+        # feature dimension
         assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+        # key/value dimension
         assert k.shape[-2] == v.shape[-2]
         assert q.device == k.device == v.device
         assert q.is_cuda, "Expected CUDA Tensors"
@@ -633,14 +637,17 @@ class FlashAttentionTriton(torch.autograd.Function):
         ctx.Q_TILE_SIZE = 16
         ctx.K_TILE_SIZE = 16
 
-        flash_attention_fwd_kernel[(triton.cdiv(N_QUERIES, ctx.Q_TILE_SIZE), q.shape[0])](
+        num_program_instances = math.prod(q.shape[:-2])
+        flash_attention_fwd_kernel[
+            (triton.cdiv(N_QUERIES, ctx.Q_TILE_SIZE), num_program_instances)
+        ](
             # fmt: off
             q, k, v, Out, Logsumexp,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            Out.stride(0), Out.stride(1), Out.stride(2),
-            Logsumexp.stride(0), Logsumexp.stride(1),
+            q.stride(-3), q.stride(-2), q.stride(-1),
+            k.stride(-3), k.stride(-2), k.stride(-1),
+            v.stride(-3), v.stride(-2), v.stride(-1),
+            Out.stride(-3), Out.stride(-2), Out.stride(-1),
+            Logsumexp.stride(-2), Logsumexp.stride(-1),
             N_QUERIES, N_KEYS, 1 / math.sqrt(D), D,
             Q_TILE_SIZE=ctx.Q_TILE_SIZE,
             K_TILE_SIZE=ctx.K_TILE_SIZE,
@@ -658,27 +665,27 @@ class FlashAttentionTriton(torch.autograd.Function):
         q, k, v, Out, Logsumexp = ctx.saved_tensors
         is_causal = ctx.is_causal
 
-        batch_size = q.shape[0]
-        num_queries = q.shape[1]
-        num_keys = k.shape[1]
-        D = q.shape[2]
+        num_queries = q.shape[-2]
+        num_keys = k.shape[-2]
+        D = q.shape[-1]
 
         dQ = torch.empty_like(q)
         dK = torch.empty_like(k)
         dV = torch.empty_like(v)
         dO = grad_output
 
-        flash_attention_bwd_dq_kernel[(batch_size, triton.cdiv(num_queries, ctx.Q_TILE_SIZE))](
+        num_program_instances = math.prod(q.shape[:-2])
+        flash_attention_bwd_dq_kernel[(num_program_instances, triton.cdiv(num_queries, ctx.Q_TILE_SIZE))](
             # fmt: off
             q, k, v, Out, Logsumexp,
             dQ, dO,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            Out.stride(0), Out.stride(1), Out.stride(2),
-            Logsumexp.stride(0), Logsumexp.stride(1),
-            dQ.stride(0), dQ.stride(1), dQ.stride(2),
-            dO.stride(0), dO.stride(1), dO.stride(2),
+            q.stride(-3), q.stride(-2), q.stride(-1),
+            k.stride(-3), k.stride(-2), k.stride(-1),
+            v.stride(-3), v.stride(-2), v.stride(-1),
+            Out.stride(-3), Out.stride(-2), Out.stride(-1),
+            Logsumexp.stride(-2), Logsumexp.stride(-1),
+            dQ.stride(-3), dQ.stride(-2), dQ.stride(-1),
+            dO.stride(-3), dO.stride(-2), dO.stride(-1),
             num_queries, num_keys, 1 / math.sqrt(D),
             D=D,
             Q_TILE_SIZE=ctx.Q_TILE_SIZE,
@@ -687,18 +694,18 @@ class FlashAttentionTriton(torch.autograd.Function):
             # fmt: on
         )
 
-        flash_attention_bwd_dkdv_kernel[(batch_size, triton.cdiv(num_keys, ctx.K_TILE_SIZE))](
+        flash_attention_bwd_dkdv_kernel[(num_program_instances, triton.cdiv(num_keys, ctx.K_TILE_SIZE))](
             # fmt: off
             q, k, v, Out, Logsumexp,
             dK, dV, dO,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            Out.stride(0), Out.stride(1), Out.stride(2),
-            Logsumexp.stride(0), Logsumexp.stride(1),
-            dK.stride(0), dK.stride(1), dK.stride(2),
-            dV.stride(0), dV.stride(1), dV.stride(2),
-            dO.stride(0), dO.stride(1), dO.stride(2),
+            q.stride(-3), q.stride(-2), q.stride(-1),
+            k.stride(-3), k.stride(-2), k.stride(-1),
+            v.stride(-3), v.stride(-2), v.stride(-1),
+            Out.stride(-3), Out.stride(-2), Out.stride(-1),
+            Logsumexp.stride(-2), Logsumexp.stride(-1),
+            dK.stride(-3), dK.stride(-2), dK.stride(-1),
+            dV.stride(-3), dV.stride(-2), dV.stride(-1),
+            dO.stride(-3), dO.stride(-2), dO.stride(-1),
             num_queries, num_keys, 1 / math.sqrt(D),
             D=D,
             Q_TILE_SIZE=ctx.Q_TILE_SIZE,
