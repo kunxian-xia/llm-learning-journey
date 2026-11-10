@@ -128,8 +128,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      issues: write
-      pull-requests: read
+      pull-requests: write
 
     steps:
       - name: Post or update benchmark comment
