@@ -6,6 +6,7 @@ import torch
 from cs336_basics.model import TransformerLM
 from cs336_basics.data import get_batch
 from cs336_basics.utils import try_gpu, cross_entropy_loss
+from cs336_basics.optimizer import AdamW
 
 
 def run(workload: str, model, optimizer, input, next):
@@ -26,7 +27,7 @@ def run(workload: str, model, optimizer, input, next):
             pass
         case _:
             raise ValueError(f"Unknown workload: {workload}")
-    if model.device.type == 'cuda':
+    if model.device.type == "cuda":
         torch.cuda.synchronize()
 
 
@@ -44,7 +45,7 @@ def main(args):
         "xlarge",
         "10B",
     ], f"Unknown size: {args.model_size}"
-    hyperparam = json.load(open(args.hyperparam, "r"))[args.model_size]
+    hyperparam = json.load(open(args.hyperparam, "r"))
 
     # TODO: make context_length, vocab_size, batch_size configurable in hyperparam file
     context_length = 256
@@ -52,7 +53,7 @@ def main(args):
     batch_size = 32
 
     # 2. load model and optimizer from hyperparameters
-    model_param = hyperparam["model"]
+    model_param = hyperparam[args.model_size]["model"]
     model = TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -62,6 +63,13 @@ def main(args):
         d_ff=model_param["d_ff"],
         rope_theta=model_param["rope_theta"],
         device=device,
+    )
+    optimizer = AdamW(
+        model.parameters(),
+        lr=hyperparam["optimizer"]["lr"],
+        betas=hyperparam["optimizer"]["betas"],
+        eps=hyperparam["optimizer"]["eps"],
+        weight_decay=hyperparam["optimizer"]["weight_decay"],
     )
 
     # 3. generate random batch of data
@@ -78,10 +86,10 @@ def main(args):
 
     # w warmup steps first
     for _ in range(args.warmup_steps):
-        run(workload, model, None, input, next)
+        run(workload, model, optimizer, input, next)
 
     total_time = timeit.timeit(
-        lambda: run(workload, model, None, input, next), number=10
+        lambda: run(workload, model, optimizer, input, next), number=10
     )
     print(
         "average %s pass for batch_size=%d, context_length=%d: %.4fs"
