@@ -22,6 +22,11 @@ on:
           - small
           - medium
           - large
+      batch_size:
+        description: Batch size for the benchmark
+        type: number
+        required: true
+        default: 32
 
 permissions:
   contents: read
@@ -83,6 +88,7 @@ jobs:
     env:
       UV_CACHE_DIR: /home/runner/_work/_uv_cache
       MODEL_SIZE: ${{ inputs.model_size || 'small' }}
+      BATCH_SIZE: ${{ inputs.batch_size || '32' }}
     defaults:
       run:
         working-directory: cs336/assignment2-systems
@@ -109,7 +115,7 @@ jobs:
             echo '<!-- cs336-assignment2-benchmark -->'
             echo '### Assignment 2 benchmark'
             echo
-            printf 'GPU: %s. Model: %s. Batch size: 32. Context length: 256. Five warmups and ten measured calls per workload.\n\n' "$gpu_name" "$MODEL_SIZE"
+            printf 'GPU: %s. Model: %s. Batch size: %s. Context length: 256. Five warmups and ten measured calls per workload.\n\n' "$gpu_name" "$MODEL_SIZE" "$BATCH_SIZE"
             echo '| Workload | Average time (s) |'
             echo '| --- | ---: |'
           } > "$report"
@@ -117,6 +123,7 @@ jobs:
             output=$(uv run --frozen python bin/benchmark.py \
               --hyperparam bin/hyperparam.json \
               --model_size "$MODEL_SIZE" \
+              --batch_size "$BATCH_SIZE" \
               --corpus_path ../assignment1-basics/data/tinystories_valid_token.bin \
               --device cuda \
               --workload "$workload" \
