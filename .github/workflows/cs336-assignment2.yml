@@ -12,6 +12,16 @@ on:
       - "cs336/assignment2-systems/**"
       - ".github/workflows/cs336-assignment2.yml"
   workflow_dispatch:
+    inputs:
+      model_size:
+        description: Model size for the benchmark
+        type: choice
+        required: true
+        default: small
+        options:
+          - small
+          - medium
+          - large
 
 permissions:
   contents: read
@@ -72,6 +82,7 @@ jobs:
       report: ${{ steps.benchmark-report.outputs.markdown }}
     env:
       UV_CACHE_DIR: /home/runner/_work/_uv_cache
+      MODEL_SIZE: ${{ inputs.model_size || 'small' }}
     defaults:
       run:
         working-directory: cs336/assignment2-systems
@@ -98,14 +109,14 @@ jobs:
             echo '<!-- cs336-assignment2-benchmark -->'
             echo '### Assignment 2 benchmark'
             echo
-            printf 'GPU: %s. Model: small. Batch size: 32. Context length: 256. Five warmups and ten measured calls per workload.\n\n' "$gpu_name"
+            printf 'GPU: %s. Model: %s. Batch size: 32. Context length: 256. Five warmups and ten measured calls per workload.\n\n' "$gpu_name" "$MODEL_SIZE"
             echo '| Workload | Average time (s) |'
             echo '| --- | ---: |'
           } > "$report"
           for workload in forward forward_backward full; do
             output=$(uv run --frozen python bin/benchmark.py \
               --hyperparam bin/hyperparam.json \
-              --model_size small \
+              --model_size "$MODEL_SIZE" \
               --corpus_path ../assignment1-basics/data/tinystories_valid_token.bin \
               --device cuda \
               --workload "$workload" \
