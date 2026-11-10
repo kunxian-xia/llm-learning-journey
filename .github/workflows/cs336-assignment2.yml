@@ -125,11 +125,11 @@ jobs:
   benchmark-comment:
     name: Comment benchmark on PR
     needs: benchmark
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
       issues: write
+      pull-requests: read
 
     steps:
       - name: Post or update benchmark comment
