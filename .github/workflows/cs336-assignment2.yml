@@ -68,6 +68,8 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, gpu]
     timeout-minutes: 60
+    outputs:
+      report: ${{ steps.benchmark-report.outputs.markdown }}
     env:
       UV_CACHE_DIR: /home/runner/_work/_uv_cache
     defaults:
@@ -86,6 +88,7 @@ jobs:
           enable-cache: false
 
       - name: Run benchmarks and build report
+        id: benchmark-report
         run: |
           set -euo pipefail
           nvidia-smi
@@ -113,13 +116,11 @@ jobs:
             printf '| %s | %s |\n' "$workload" "$average" >> "$report"
           done
           cat "$report" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload benchmark report
-        uses: actions/upload-artifact@v4
-        with:
-          name: assignment2-benchmark-report
-          path: ${{ runner.temp }}/assignment2-benchmark.md
-          if-no-files-found: error
+          {
+            echo 'markdown<<BENCHMARK_REPORT_END'
+            cat "$report"
+            echo 'BENCHMARK_REPORT_END'
+          } >> "$GITHUB_OUTPUT"
 
   benchmark-comment:
     name: Comment benchmark on PR
@@ -131,17 +132,13 @@ jobs:
       issues: write
 
     steps:
-      - name: Download benchmark report
-        uses: actions/download-artifact@v4
-        with:
-          name: assignment2-benchmark-report
-
       - name: Post or update benchmark comment
         uses: actions/github-script@v8
+        env:
+          BENCHMARK_REPORT: ${{ needs.benchmark.outputs.report }}
         with:
           script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('assignment2-benchmark.md', 'utf8');
+            const body = process.env.BENCHMARK_REPORT;
             const marker = '<!-- cs336-assignment2-benchmark -->';
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
