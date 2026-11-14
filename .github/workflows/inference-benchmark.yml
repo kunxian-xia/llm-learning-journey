@@ -1,0 +1,205 @@
+name: Inference benchmark
+
+on:
+  pull_request:
+    paths:
+      - "inference-serving-runtime/**"
+      - ".github/workflows/inference-benchmark.yml"
+  push:
+    branches: [master]
+    paths:
+      - "inference-serving-runtime/**"
+      - ".github/workflows/inference-benchmark.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize measurements and history writes on the single GPU runner.
+concurrency:
+  group: inference-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    # The self-hosted GPU runner must never execute code from a fork PR.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+    outputs:
+      result_ready: ${{ steps.run.outcome }}
+    env:
+      UV_CACHE_DIR: /home/runner/_work/_uv_cache
+      HF_HOME: /home/runner/_work/_hf_cache
+      MODEL_REVISION: 060db6499f32faf8b98477b0a26969ef7d8b9987
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+
+    steps:
+      - name: Check out head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Check out base for paired comparison
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Install locked dependencies
+        working-directory: inference-serving-runtime
+        run: uv sync --frozen --extra test
+
+      - name: Run Qwen2.5 benchmark
+        id: run
+        working-directory: inference-serving-runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          nvidia-smi
+          args=()
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            args+=(--base-source "$GITHUB_WORKSPACE/base/inference-serving-runtime/src/inference_serving_runtime/adapters/qwen25.py")
+          fi
+          uv run --frozen --no-sync python benchmarks/compare_revisions.py \
+            --output-dir "$RUNNER_TEMP/inference-benchmark" \
+            --revision "$MODEL_REVISION" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${args[@]}"
+          cat "$RUNNER_TEMP/inference-benchmark/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark result
+        if: steps.run.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen25-benchmark
+          path: ${{ runner.temp }}/inference-benchmark/
+          retention-days: 90
+
+      - name: Reject performance regression
+        if: steps.run.outcome == 'success' && github.event_name == 'pull_request'
+        run: |
+          python - "$RUNNER_TEMP/inference-benchmark/result.json" <<'PY'
+          import json
+          import sys
+
+          result = json.load(open(sys.argv[1]))
+          if result["failed"]:
+              raise SystemExit("Qwen2.5 prefill or decode exceeded the regression threshold")
+          PY
+
+  comment:
+    name: Comment on PR
+    needs: benchmark
+    if: always() && github.event_name == 'pull_request' && needs.benchmark.outputs.result_ready == 'success' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: qwen25-benchmark
+          path: result
+
+      - name: Upsert benchmark comment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('result/comment.md', 'utf8');
+            const marker = '<!-- inference-serving-benchmark -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const previous = comments.find(comment =>
+              comment.user?.login === 'github-actions[bot]' && comment.body?.includes(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: previous.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  publish:
+    name: Record and publish history
+    needs: benchmark
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && needs.benchmark.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out benchmark source
+        uses: actions/checkout@v7
+        with:
+          path: source
+
+      - name: Check out persistent history
+        uses: actions/checkout@v7
+        with:
+          path: pages
+
+      - name: Switch to history branch
+        run: |
+          set -euo pipefail
+          if git -C pages ls-remote --exit-code --heads origin gh-pages > /dev/null; then
+            git -C pages fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git -C pages switch -c gh-pages --track origin/gh-pages
+          else
+            git -C pages switch --orphan gh-pages
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: qwen25-benchmark
+          path: result
+
+      - name: Append history and push storage branch
+        run: |
+          set -euo pipefail
+          python source/inference-serving-runtime/benchmarks/update_history.py \
+            --result result/result.json --pages-dir pages
+          git -C pages config user.name 'github-actions[bot]'
+          git -C pages config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C pages add -- inference-serving-runtime/history.json inference-serving-runtime/index.html index.html .nojekyll
+          if ! git -C pages diff --cached --quiet; then
+            git -C pages commit -m "Record inference benchmark $GITHUB_SHA"
+            git -C pages push origin gh-pages
+          fi
+          mkdir site
+          cp -r pages/inference-serving-runtime site/
+          cp pages/index.html site/
+          touch site/.nojekyll
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
