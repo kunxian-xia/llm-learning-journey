@@ -91,8 +91,9 @@ jobs:
 
       - name: Reject performance regression
         if: steps.run.outcome == 'success' && github.event_name == 'pull_request'
+        working-directory: inference-serving-runtime
         run: |
-          python - "$RUNNER_TEMP/inference-benchmark/result.json" <<'PY'
+          uv run --frozen --no-sync python - "$RUNNER_TEMP/inference-benchmark/result.json" <<'PY'
           import json
           import sys
 
