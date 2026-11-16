@@ -64,6 +64,7 @@ class Qwen25Decoder:
             attention = layer.self_attn
             batch, seq_len, _ = normed.shape
             head_dim = attention.head_dim
+            # Rearrange [batch, seq, heads * head_dim] into [batch, heads, seq, head_dim].
             q = attention.q_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
             k = attention.k_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
             v = attention.v_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
