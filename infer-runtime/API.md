@@ -105,7 +105,7 @@ This first contract is for text prompts and text output. Multimodal inputs requi
 
 ## Implementation handoff
 
-Suggested layout: `src/inference_serving_runtime/{api.py,engine.py,adapters/tiny_lm.py,adapters/huggingface.py}`, with tests under `tests/`. Keep imports from `cs336_basics` and `transformers` inside their respective optional adapters.
+Suggested layout: `src/infer_runtime/{api.py,engine.py,adapters/tiny_lm.py,adapters/huggingface.py}`, with tests under `tests/`. Keep imports from `cs336_basics` and `transformers` inside their respective optional adapters.
 
 Acceptance checks:
 
