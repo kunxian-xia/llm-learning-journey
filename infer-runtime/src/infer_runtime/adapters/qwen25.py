@@ -64,7 +64,9 @@ class Qwen25Decoder:
             attention = layer.self_attn
             batch, seq_len, _ = normed.shape
             head_dim = attention.head_dim
-            # Rearrange [batch, seq, heads * head_dim] into [batch, heads, seq, head_dim].
+            # All projections take hidden_size inputs; q_proj outputs Hq * D,
+            # while k_proj and v_proj each output Hkv * D.
+            # Rearrange to q [B, Hq, S, D] and k/v [B, Hkv, S, D].
             q = attention.q_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
             k = attention.k_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
             v = attention.v_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
@@ -72,10 +74,13 @@ class Qwen25Decoder:
             k = k * cos + _rotate_half(k) * sin
             if cache.sequence_length:
                 old_k, old_v = cache.layers[layer_index]
+                # Append this step's keys and values along the sequence axis.
+                # Each becomes [B, Hkv, past_len + S, D].
                 k = torch.cat((old_k, k), dim=-2)
                 v = torch.cat((old_v, v), dim=-2)
             new_layers.append((k, v))
 
+            # GQA shares each KV head across Hq / Hkv query heads.
             attended = F.scaled_dot_product_attention(
                 q, k, v, is_causal=cache.sequence_length == 0, enable_gqa=True
             )
