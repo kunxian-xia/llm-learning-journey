@@ -13,7 +13,7 @@ import torch
 import transformers
 from transformers import AutoModelForCausalLM
 
-from inference_serving_runtime.adapters import Qwen25Decoder
+from infer_runtime.adapters import Qwen25Decoder
 
 
 def main() -> None:

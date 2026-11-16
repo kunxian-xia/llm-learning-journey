@@ -1,4 +1,4 @@
-# Inference serving runtime
+# Infer runtime
 
 A standalone toy project for experimenting with an inference serving runtime.
 
@@ -10,7 +10,7 @@ Start with the [single-request API contract](API.md) for issue #49.
 
 ```python
 from transformers import AutoModelForCausalLM
-from inference_serving_runtime.adapters import Qwen25Decoder
+from infer_runtime.adapters import Qwen25Decoder
 
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B")
 decoder = Qwen25Decoder(model)

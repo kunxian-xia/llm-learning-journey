@@ -3,12 +3,12 @@ name: Inference benchmark
 on:
   pull_request:
     paths:
-      - "inference-serving-runtime/**"
+      - "infer-runtime/**"
       - ".github/workflows/inference-benchmark.yml"
   push:
     branches: [master]
     paths:
-      - "inference-serving-runtime/**"
+      - "infer-runtime/**"
       - ".github/workflows/inference-benchmark.yml"
   workflow_dispatch:
 
@@ -55,19 +55,19 @@ jobs:
           enable-cache: false
 
       - name: Install locked dependencies
-        working-directory: inference-serving-runtime
+        working-directory: infer-runtime
         run: uv sync --frozen --extra test
 
       - name: Run Qwen2.5 benchmark
         id: run
-        working-directory: inference-serving-runtime
+        working-directory: infer-runtime
         shell: bash
         run: |
           set -euo pipefail
           nvidia-smi
           args=()
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            args+=(--base-source "$GITHUB_WORKSPACE/base/inference-serving-runtime/src/inference_serving_runtime/adapters/qwen25.py")
+            args+=(--base-source "$GITHUB_WORKSPACE/base/infer-runtime/src/infer_runtime/adapters/qwen25.py")
           fi
           uv run --frozen --no-sync python benchmarks/compare_revisions.py \
             --output-dir "$RUNNER_TEMP/inference-benchmark" \
@@ -89,7 +89,7 @@ jobs:
 
       - name: Reject performance regression
         if: steps.run.outcome == 'success' && github.event_name == 'pull_request'
-        working-directory: inference-serving-runtime
+        working-directory: infer-runtime
         run: |
           uv run --frozen --no-sync python - "$RUNNER_TEMP/inference-benchmark/result.json" <<'PY'
           import json

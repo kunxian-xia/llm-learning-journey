@@ -2,7 +2,7 @@ import pytest
 import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from inference_serving_runtime.adapters.qwen25 import Qwen25Decoder
+from infer_runtime.adapters.qwen25 import Qwen25Decoder
 
 
 @pytest.fixture

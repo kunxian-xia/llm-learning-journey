@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from transformers import Qwen2ForCausalLM
 
-from inference_serving_runtime.api import Logits
+from infer_runtime.api import Logits
 
 
 @dataclass

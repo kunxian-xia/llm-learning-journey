@@ -1,5 +1,5 @@
 [project]
-name = "inference-serving-runtime"
+name = "infer-runtime"
 version = "0.1.0"
 description = "Single-request inference runtime experiments"
 requires-python = ">=3.11"
