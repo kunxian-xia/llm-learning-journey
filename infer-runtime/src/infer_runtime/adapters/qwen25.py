@@ -81,9 +81,14 @@ class Qwen25Decoder:
             new_layers.append((k, v))
 
             # GQA shares each KV head across Hq / Hkv query heads.
+            # Prefill needs a causal mask so prompt tokens cannot see future tokens.
+            # Decode supplies one query, which may attend to every cached key;
+            # multi-token updates with a nonempty cache would need a position-aware mask.
             attended = F.scaled_dot_product_attention(
                 q, k, v, is_causal=cache.sequence_length == 0, enable_gqa=True
             )
+            # One output per query token: [B, Hq, S, D], even when K/V include past tokens.
+            # Merge query heads for o_proj: [B, S, Hq * D].
             attended = attended.transpose(1, 2).reshape(batch, seq_len, -1)
             hidden = residual + attention.o_proj(attended)
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
