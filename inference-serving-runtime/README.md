@@ -23,5 +23,3 @@ Install the project with its `test` extra and run `pytest` from this directory. 
 ## Benchmark CI
 
 The [inference benchmark workflow](../.github/workflows/inference-benchmark.yml) measures a pinned Qwen2.5-0.5B checkpoint on the self-hosted GPU runner for same-repository PRs. It compares the PR adapter with the base branch adapter on the same runner, and also records Hugging Face cached decoding. While a base branch has no adapter, the Hugging Face path is the reference. For each 128- and 4096-token prompt, a PR fails if median decode time rises by more than 20% or prefill time by more than 30%. Results use fixed token IDs, 32 decode steps, two warmups, five measured runs, and FP16. The workflow posts or updates one PR comment even when the regression gate fails.
-
-Successful runs on `master` and weekly scheduled runs append to the [public benchmark history](https://kunxian-xia.github.io/llm-learning-journey/inference-serving-runtime/). The `gh-pages` branch stores the JSON history, while the workflow deploys the site through GitHub Pages. Benchmark results are hardware-specific; compare runs with the same GPU and dependency versions.

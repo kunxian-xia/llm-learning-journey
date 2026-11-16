@@ -10,14 +10,12 @@ on:
     paths:
       - "inference-serving-runtime/**"
       - ".github/workflows/inference-benchmark.yml"
-  schedule:
-    - cron: "17 3 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Serialize measurements and history writes on the single GPU runner.
+# Serialize measurements on the single GPU runner.
 concurrency:
   group: inference-benchmark
   cancel-in-progress: false
@@ -138,69 +136,3 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
-
-  publish:
-    name: Record and publish history
-    needs: benchmark
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && needs.benchmark.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: write
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Check out benchmark source
-        uses: actions/checkout@v7
-        with:
-          path: source
-
-      - name: Check out persistent history
-        uses: actions/checkout@v7
-        with:
-          path: pages
-
-      - name: Switch to history branch
-        run: |
-          set -euo pipefail
-          if git -C pages ls-remote --exit-code --heads origin gh-pages > /dev/null; then
-            git -C pages fetch origin gh-pages:refs/remotes/origin/gh-pages
-            git -C pages switch -c gh-pages --track origin/gh-pages
-          else
-            git -C pages switch --orphan gh-pages
-          fi
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: qwen25-benchmark
-          path: result
-
-      - name: Append history and push storage branch
-        run: |
-          set -euo pipefail
-          python source/inference-serving-runtime/benchmarks/update_history.py \
-            --result result/result.json --pages-dir pages
-          git -C pages config user.name 'github-actions[bot]'
-          git -C pages config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git -C pages add -- inference-serving-runtime/history.json inference-serving-runtime/index.html index.html .nojekyll
-          if ! git -C pages diff --cached --quiet; then
-            git -C pages commit -m "Record inference benchmark $GITHUB_SHA"
-            git -C pages push origin gh-pages
-          fi
-          mkdir site
-          cp -r pages/inference-serving-runtime site/
-          cp pages/index.html site/
-          touch site/.nojekyll
-
-      - uses: actions/configure-pages@v5
-        with:
-          enablement: true
-      - uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
-      - name: Deploy GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
