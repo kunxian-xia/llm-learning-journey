@@ -45,6 +45,11 @@ class Qwen25Decoder:
         if not isinstance(token_id, int) or not 0 <= token_id < self.vocab_size:
             raise ValueError(f"token ID must be in [0, {self.vocab_size})")
 
+    def _normalize_qk(
+        self, attention: torch.nn.Module, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return q, k
+
     @torch.inference_mode()
     def _forward(self, token_ids: Sequence[int], cache: Qwen25KVCache) -> Logits:
         if cache.sequence_length + len(token_ids) > self.context_length:
@@ -70,6 +75,7 @@ class Qwen25Decoder:
             q = attention.q_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
             k = attention.k_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
             v = attention.v_proj(normed).view(batch, seq_len, -1, head_dim).transpose(1, 2)
+            q, k = self._normalize_qk(attention, q, k)
             q = q * cos + _rotate_half(q) * sin
             k = k * cos + _rotate_half(k) * sin
             if cache.sequence_length:

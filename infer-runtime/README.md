@@ -20,6 +20,21 @@ logits = decoder.decode_step(4, cache)
 
 Install the project with its `test` extra and run `pytest` from this directory. The correctness tests initialize a tiny Qwen2 model locally and compare cached logits against uncached Hugging Face forward passes; they do not download checkpoint weights.
 
+## Qwen3-Coder MoE adapter
+
+`Qwen3CoderDecoder` accepts an already-loaded `Qwen3MoeForCausalLM` on one device, including the architecture of `Qwen/Qwen3-Coder-30B-A3B-Instruct`. It uses the model's Q/K normalization and routed expert MLPs while maintaining its own full-attention KV cache. It has the same `prefill(input_ids, kv_cache=None)` and `decode_step(new_token, kv_cache)` interface. Sliding-window configurations are rejected.
+
+```python
+from infer_runtime.adapters import Qwen3CoderDecoder
+
+# model: Qwen3MoeForCausalLM, already loaded on one device
+decoder = Qwen3CoderDecoder(model)
+cache, logits = decoder.prefill([1, 2, 3])  # use IDs from the matching tokenizer
+cache, logits = decoder.prefill([4, 5], cache)
+```
+
+Correctness tests use a small local Qwen3 MoE configuration and compare its logits with Hugging Face full forward passes; they do not download the 30B checkpoint.
+
 ## Benchmark CI
 
 The [inference benchmark workflow](../.github/workflows/inference-benchmark.yml) measures a pinned Qwen2.5-0.5B checkpoint on the self-hosted GPU runner for same-repository PRs. It compares the PR adapter with the base branch adapter on the same runner, and also records Hugging Face cached decoding. While a base branch has no adapter, the Hugging Face path is the reference. For each 128- and 4096-token prompt, a PR fails if median decode time rises by more than 20% or prefill time by more than 30%. Results use fixed token IDs, 32 decode steps, two warmups, five measured runs, and FP16. The workflow posts or updates one PR comment even when the regression gate fails.
