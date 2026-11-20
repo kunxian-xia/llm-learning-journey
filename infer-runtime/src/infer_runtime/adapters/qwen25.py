@@ -81,11 +81,15 @@ class Qwen25Decoder:
             new_layers.append((k, v))
 
             # GQA shares each KV head across Hq / Hkv query heads.
-            # Prefill needs a causal mask so prompt tokens cannot see future tokens.
-            # Decode supplies one query, which may attend to every cached key;
-            # multi-token updates with a nonempty cache would need a position-aware mask.
+            # With cached keys, align the causal mask to the new tokens' positions.
+            mask = None
+            if cache.sequence_length and seq_len > 1:
+                query_positions = cache.sequence_length + torch.arange(seq_len, device=q.device)
+                key_positions = torch.arange(k.shape[-2], device=q.device)
+                mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
             attended = F.scaled_dot_product_attention(
-                q, k, v, is_causal=cache.sequence_length == 0, enable_gqa=True
+                q, k, v, attn_mask=mask, is_causal=cache.sequence_length == 0,
+                enable_gqa=True,
             )
             # One output per query token: [B, Hq, S, D], even when K/V include past tokens.
             # Merge query heads for o_proj: [B, S, Hq * D].
@@ -99,13 +103,19 @@ class Qwen25Decoder:
         cache.sequence_length += len(token_ids)
         return Logits(logits)
 
-    def prefill(self, prompt_ids: Sequence[int]) -> tuple[Qwen25KVCache, Logits]:
-        if not prompt_ids:
-            raise ValueError("prompt must contain at least one token")
-        for token_id in prompt_ids:
+    def prefill(
+        self, input_ids: Sequence[int], kv_cache: Qwen25KVCache | None = None
+    ) -> tuple[Qwen25KVCache, Logits]:
+        if not input_ids:
+            raise ValueError("input must contain at least one token")
+        for token_id in input_ids:
             self._check_token(token_id)
-        cache = Qwen25KVCache()
-        return cache, self._forward(prompt_ids, cache)
+        cache = Qwen25KVCache() if kv_cache is None else kv_cache
+        if not isinstance(cache, Qwen25KVCache):
+            raise TypeError("kv_cache must be a Qwen25KVCache")
+        if cache.sequence_length and len(cache.layers) != len(self.model.model.layers):
+            raise ValueError("cache has not been initialized for this model")
+        return cache, self._forward(input_ids, cache)
 
     def decode_step(self, new_token: int, kv_cache: Qwen25KVCache) -> Logits:
         self._check_token(new_token)

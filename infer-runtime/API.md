@@ -56,7 +56,9 @@ class DecoderModel(Protocol):
     @property
     def context_length(self) -> int: ...
 
-    def prefill(self, prompt_ids: Sequence[int]) -> tuple[KVCache, Logits]: ...
+    def prefill(
+        self, input_ids: Sequence[int], kv_cache: KVCache | None = None
+    ) -> tuple[KVCache, Logits]: ...
     def decode_step(self, new_token: int, kv_cache: KVCache) -> Logits: ...
 
 @dataclass(frozen=True)
@@ -70,7 +72,7 @@ class InferenceEngine:
     def generate(self, request: GenerateRequest) -> GenerateResult: ...
 ```
 
-`prefill` consumes the entire prompt once and returns `(kv_cache, logits)` for the **first** new token. The cache holds the model's incremental decoding state, with `sequence_length == len(prompt_ids)`. `decode_step` consumes one previously selected token, advances the **same** cache object, increments `sequence_length` by one, and returns logits for the **next** token. The adapter derives the consumed token's position from `kv_cache.sequence_length` before advancing it; the engine does not pass a separate position. The engine treats cache contents as opaque. Despite its name, `KVCache` may also wrap recurrent or hybrid attention state. Construct a logits object with `Logits(tensor=some_torch_tensor)`. Its tensor has shape `[vocab_size]`, is indexed by token ID, remains on the model's device, and has no gradient history. `Float[torch.Tensor, "vocab"]` is the concrete jaxtyping spelling of the proposed `FloatTensor[V]` shape annotation.
+`prefill` consumes one or more known input tokens and returns `(kv_cache, logits)` for the next token. With `kv_cache=None`, it creates a cache for the initial prompt. With an existing cache, it advances and returns that same cache after appending the input tokens. Each appended token may attend to the old cache and earlier appended tokens, but not later ones. The cache's `sequence_length` increases by `len(input_ids)`. `decode_step` consumes only the supplied `new_token`; it reads past tokens from the cache without consuming them again. It advances the **same** cache object by one position and returns logits for the **next** token. The adapter derives positions from `kv_cache.sequence_length`; the engine does not pass a separate position. The engine treats cache contents as opaque. Despite its name, `KVCache` may also wrap recurrent or hybrid attention state. Construct a logits object with `Logits(tensor=some_torch_tensor)`. Its tensor has shape `[vocab_size]`, is indexed by token ID, remains on the model's device, and has no gradient history. `Float[torch.Tensor, "vocab"]` is the concrete jaxtyping spelling of the proposed `FloatTensor[V]` shape annotation.
 
 `decode_step` computes logits; `select_next_token` chooses an ID from them. Logits are unnormalized scores, so the model method is not called `get_next_token_prob`. The selector owns token choice for both prefill and decode-step logits. In `greedy` mode it returns `torch.argmax(logits).item()`; ties choose the lowest token ID. In `multinomial` mode it divides logits by positive `temperature`, applies a numerically stable softmax, and draws with `torch.multinomial(..., generator=sampling.generator)`. The optional generator gives reproducible draws when seeded and placed on the logits device. Temperature is ignored in greedy mode. The selector rejects non-1D, empty, or non-finite logits and invalid sampling settings with `ValueError`; it never mutates logits.
 
@@ -81,6 +83,8 @@ next_token = select_next_token(logits.tensor, sampling)
 logits = model.decode_step(next_token, kv_cache)
 next_token = select_next_token(logits.tensor, sampling)
 ```
+
+To continue after a user message or tool result, encode the new message and call `model.prefill(new_input_ids, kv_cache)` before resuming the decode loop. The cache must match the exact token prefix being continued. The single-request generation loop leaves its final sampled token outside the cache; if that token belongs in the next prompt, include it once in the next `prefill` input before the new message tokens.
 
 ## Generation rules
 
@@ -116,5 +120,6 @@ Acceptance checks:
 - Length and context boundaries, empty encoded prompts, invalid token IDs, and malformed logits produce the specified errors.
 - An integration check runs a tiny cache-capable model through the adapter on CPU and compares prefill and incremental decode logits with a full forward pass at each position (within floating-point tolerance). It also verifies cache length and token count; it need not assert generated prose.
 - A small open weight text checkpoint, or a local fixture with the same adapter interface, runs through the same engine without changing core code. Avoid downloading large weights in routine CI.
+- A cached multi-token `prefill` matches a full forward pass after prior prefill and decode steps, including repeated input appends and cache length checks.
 
 Out of scope for this issue: concurrency, batching, HTTP transport, streaming, and cancellation.

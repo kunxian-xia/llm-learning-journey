@@ -6,7 +6,7 @@ Start with the [single-request API contract](API.md) for issue #49.
 
 ## Qwen2.5 prefill and decode adapter
 
-`Qwen25Decoder` takes an already-loaded Hugging Face `Qwen2ForCausalLM` for its weights and non-attention layers. It computes causal attention and maintains its own per-layer KV cache without calling the Hugging Face transformer forward method. `prefill(prompt_ids)` and `decode_step(new_token, kv_cache)` return last-position next-token logits; the cache advances in place. Qwen2.5 text checkpoints use this model architecture. This first version handles one sequence on one device and full-attention configurations.
+`Qwen25Decoder` takes an already-loaded Hugging Face `Qwen2ForCausalLM` for its weights and non-attention layers. It computes causal attention and maintains its own per-layer KV cache without calling the Hugging Face transformer forward method. `prefill(input_ids)` starts a cache; `prefill(input_ids, kv_cache)` appends a batch of input tokens to it; `decode_step(new_token, kv_cache)` consumes one generated token. All return last-position next-token logits, and existing caches advance in place. Qwen2.5 text checkpoints use this model architecture. This first version handles one sequence on one device and full-attention configurations.
 
 ```python
 from transformers import AutoModelForCausalLM

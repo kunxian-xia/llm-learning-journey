@@ -42,6 +42,30 @@ def test_cached_prefill_and_decode_match_full_forward(model: Qwen2ForCausalLM) -
             assert logits.tensor.shape == (decoder.vocab_size,)
 
 
+def test_prefill_extends_existing_cache_without_future_leakage(model: Qwen2ForCausalLM) -> None:
+    decoder = Qwen25Decoder(model)
+    tokens = [4, 12, 20]
+
+    with torch.inference_mode():
+        cache, _ = decoder.prefill(tokens)
+        decoder.decode_step(9, cache)
+        tokens.append(9)
+
+        for new_input in ([7, 13, 2], [5, 6]):
+            same_cache, logits = decoder.prefill(new_input, cache)
+            assert same_cache is cache
+            tokens.extend(new_input)
+            reference = model(torch.tensor([tokens]), use_cache=False).logits[0, -1]
+            torch.testing.assert_close(logits.tensor, reference, rtol=1e-5, atol=1e-5)
+            assert cache.sequence_length == len(tokens)
+
+            # A later decode reads every appended key, exposing future-token leakage.
+            logits = decoder.decode_step(8, cache)
+            tokens.append(8)
+            reference = model(torch.tensor([tokens]), use_cache=False).logits[0, -1]
+            torch.testing.assert_close(logits.tensor, reference, rtol=1e-5, atol=1e-5)
+
+
 def test_adapter_does_not_call_hf_transformer_forward(
     model: Qwen2ForCausalLM, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -65,6 +89,8 @@ def test_context_boundary_and_fresh_cache(model: Qwen2ForCausalLM) -> None:
     full_cache, _ = decoder.prefill([1] * decoder.context_length)
     with pytest.raises(ValueError, match="context length"):
         decoder.decode_step(2, full_cache)
+    with pytest.raises(ValueError, match="context length"):
+        decoder.prefill([2], full_cache)
 
 
 @pytest.mark.parametrize("prompt", [[], [97], [-1]])
