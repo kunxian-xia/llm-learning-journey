@@ -1,0 +1,19 @@
+[project]
+name = "infer-runtime"
+version = "0.1.0"
+description = "Single-request inference runtime experiments"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.4", "transformers>=4.51,<6", "socksio>=1,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
