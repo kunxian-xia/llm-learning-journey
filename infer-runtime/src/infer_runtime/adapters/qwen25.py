@@ -50,6 +50,17 @@ class Qwen25Decoder:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return q, k
 
+    def _mlp_output(self, layer: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+        return layer.mlp(hidden)
+
+    def _attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        mask: torch.Tensor | None, is_causal: bool,
+    ) -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=is_causal, enable_gqa=True,
+        )
+
     @torch.inference_mode()
     def _forward(self, token_ids: Sequence[int], cache: Qwen25KVCache) -> Logits:
         if cache.sequence_length + len(token_ids) > self.context_length:
@@ -93,15 +104,12 @@ class Qwen25Decoder:
                 query_positions = cache.sequence_length + torch.arange(seq_len, device=q.device)
                 key_positions = torch.arange(k.shape[-2], device=q.device)
                 mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-            attended = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=cache.sequence_length == 0,
-                enable_gqa=True,
-            )
+            attended = self._attention(q, k, v, mask, cache.sequence_length == 0)
             # One output per query token: [B, Hq, S, D], even when K/V include past tokens.
             # Merge query heads for o_proj: [B, S, Hq * D].
             attended = attended.transpose(1, 2).reshape(batch, seq_len, -1)
             hidden = residual + attention.o_proj(attended)
-            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = hidden + self._mlp_output(layer, layer.post_attention_layernorm(hidden))
 
         hidden = self.model.model.norm(hidden)
         logits = self.model.lm_head(hidden)[0, -1, :].detach()

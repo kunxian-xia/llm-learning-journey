@@ -35,6 +35,14 @@ cache, logits = decoder.prefill([4, 5], cache)
 
 Correctness tests use a small local Qwen3 MoE configuration and compare its logits with Hugging Face full forward passes; they do not download the 30B checkpoint.
 
+To measure the real 4-bit checkpoint, install this package, `autoawq==0.2.9`, `accelerate`, and `transformers==4.52.3` in a separate Python environment with CUDA PyTorch, then run:
+
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python benchmarks/compare_qwen3_coder_awq.py
+```
+
+The benchmark uses a pinned revision of `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ` and runs both `Qwen3CoderDecoder` and Hugging Face cached forward on its actual weights. It reports prefill and decode latency, logit differences, and whether the top token matches. The AWQ MoE path can amplify small floating-point differences, so inspect those accuracy fields alongside throughput. AutoAWQ misinterprets the checkpoint's `.mlp.gate` exclusion as a layer-relative name, so the benchmark corrects that config entry in a temporary directory of symlinks; the checkpoint files remain untouched. This benchmark is separate from the Qwen2.5 CI regression gate.
+
 ## Benchmark CI
 
 The [inference benchmark workflow](../.github/workflows/inference-benchmark.yml) measures a pinned Qwen2.5-0.5B checkpoint on the self-hosted GPU runner for same-repository PRs. It compares the PR adapter with the base branch adapter on the same runner, and also records Hugging Face cached decoding. While a base branch has no adapter, the Hugging Face path is the reference. For each 128- and 4096-token prompt, a PR fails if median decode time rises by more than 20% or prefill time by more than 30%. Results use fixed token IDs, 32 decode steps, two warmups, five measured runs, and FP16. The workflow posts or updates one PR comment even when the regression gate fails.
