@@ -5,6 +5,27 @@ runtime](https://github.com/kunxian-xia/llm-learning-journey/issues/47) and
 [scheduler](https://github.com/kunxian-xia/llm-learning-journey/issues/56). This document specifies interfaces; it does
 not implement them.
 
+## Table of contents
+
+- [Scope and invariants](#scope-and-invariants)
+- [Shared types](#shared-types)
+- [Scheduler API](#scheduler-api)
+  - [`add_request`](#scheduler-add-request)
+  - [`cancel`](#scheduler-cancel)
+  - [`schedule`](#scheduler-schedule)
+  - [`complete`](#scheduler-complete)
+  - [`fail`](#scheduler-fail)
+- [KV cache manager API](#kv-cache-manager-api-used-by-the-scheduler)
+  - [`estimate_reservation`](#kv-estimate-reservation)
+  - [`try_reserve`](#kv-try-reserve)
+  - [`prepare_batch`](#kv-prepare-batch)
+  - [`commit_batch`](#kv-commit-batch)
+  - [`abort_batch`](#kv-abort-batch)
+  - [`release`](#kv-release)
+- [Model runner API](#model-runner-api-used-by-the-scheduler)
+- [One-iteration lifecycle](#one-iteration-lifecycle)
+- [Service-facing asynchronous API](#service-facing-asynchronous-api)
+
 ## Scope and invariants
 
 The scheduler owns a waiting queue and a running pool. Each running request is in exactly one phase: `PREFILL` or
@@ -33,7 +54,7 @@ is a unique string.
 ```python
 RequestId = str
 Phase = Literal["prefill", "decode"]
-FinishReason = Literal["stop_token", "length", "cancelled", "error"]
+FinishReason = Literal["stop_token", "length", "cancelled", "unrunnable", "error"]
 
 @dataclass(frozen=True)
 class TokenizedRequest:
@@ -43,12 +64,24 @@ class TokenizedRequest:
     stop_token_ids: frozenset[int]
     sampling: SamplingConfig
 
+@dataclass
+class RunningRequest:
+    request: TokenizedRequest
+    phase: Phase
+    prefill_cursor: int
+    generated_token_count: int
+    pending_decode_token_id: int | None
+    cache_handle: CacheHandle
+    cancel_requested: bool = False
+
 @dataclass(frozen=True)
 class SchedulerConfig:
     max_batch_tokens: int
     max_batch_seqs: int
     max_prefill_chunk_tokens: int
     max_running_requests: int | None = None
+    max_admission_bypasses: int = 8
+    max_batch_bypasses: int = 8
 
 @dataclass(frozen=True)
 class BatchItem:
@@ -63,6 +96,11 @@ class BatchItem:
 class ReadyBatch:
     items: tuple[BatchItem, ...]
     kv_layout: KVBatchLayout
+
+@dataclass(frozen=True)
+class ScheduleResult:
+    batch: ReadyBatch | None
+    events: tuple[Event, ...]
 
 @dataclass(frozen=True)
 class ItemOutput:
@@ -104,17 +142,32 @@ chunk or decode returns a token ID.
 class Scheduler:
     def add_request(self, request: TokenizedRequest) -> None: ...
     def cancel(self, request_id: RequestId) -> list[Event]: ...
-    def schedule(self) -> ReadyBatch | None: ...
+    def schedule(self) -> ScheduleResult: ...
     def complete(self, batch: ReadyBatch, output: RunnerOutput) -> list[Event]: ...
     def fail(self, batch: ReadyBatch, error: Exception) -> list[Event]: ...
 ```
 
+The running pool is scheduler-owned mutable state, keyed by request ID:
+
+```python
+running: dict[RequestId, RunningRequest]
+```
+
+`TokenizedRequest` remains immutable. `RunningRequest.phase` tracks the current phase, `prefill_cursor` is the number of
+prompt tokens already committed to KV, and `generated_token_count` counts sampled output tokens, including a pending
+token. `pending_decode_token_id` is the sampled token to consume on the next decode step; it is `None` before the first
+sample or after termination. `cache_handle` owns the request's reservation and blocks. `cancel_requested` defers
+cancellation until an in-flight model call no longer uses the request. `BatchItem` is a per-call snapshot derived from
+this state, not an entry in the running pool.
+
+<a id="scheduler-add-request"></a>
 ### `add_request(request) -> None`
 
 Accepts an already tokenized request from the service layer and appends it to the waiting queue. It rejects duplicate
 IDs, empty prompts, invalid output limits, requests exceeding model context, and requests whose maximum KV requirement
 exceeds the entire pool. It does not reserve memory or move the request into the running pool.
 
+<a id="scheduler-cancel"></a>
 ### `cancel(request_id) -> list[Event]`
 
 Removes a waiting request immediately, or marks a running request for cancellation and releases its KV resources as soon
@@ -122,20 +175,36 @@ as no model call uses them. If the request is in the current batch, cancellation
 The method returns any `FinishedEvent(reason="cancelled")` ready now; an in-flight request's event is returned by
 `complete` or `fail`. Unknown IDs are an error.
 
-### `schedule() -> ReadyBatch | None`
+<a id="scheduler-schedule"></a>
+### `schedule() -> ScheduleResult`
 
-First scans waiting requests and calls `try_reserve` for requests that can fit; each admitted request moves to the
-running pool in `PREFILL`. The scan may pass a currently unfit request to admit smaller ones, but the selection policy
-must bound bypass so large requests do not starve. It then chooses prefill chunks and decode steps from running
-requests, observing `SchedulerConfig`; these limits must have been validated against the runner's worst-case execution
-workspace at initialization. Finally it calls `prepare_batch` and returns a fully executable `ReadyBatch`. It returns
-`None` when no work can run. Calling it while a previous batch is in flight is an error.
+Scans waiting requests and calls `try_reserve` for requests that can fit; each admitted request moves to the running
+pool with `phase=PREFILL`; this is a request state, not a separate prefill pool. A request skipped because capacity
+is temporarily unavailable accrues one admission bypass for
+that scheduling call. Once it reaches `max_admission_bypasses`, the scheduler must not admit newer requests ahead of
+it until it is admitted or terminates. This bounds bypasses, not wall-clock time: wall-clock latency also depends on
+batch execution time and resource release. It then plans prefill chunks and decode steps within `SchedulerConfig`;
+these limits must have been validated against the runner's worst-case execution workspace at initialization.
 
-The batch selection policy is internal to `schedule`. It must cap a single request's prefill chunk, use spare batch
-capacity for other fitting work, and give both prefill and decode requests progress over time. A one-token decode can
-still be expensive when it reads a long KV history, so selection may use `context_length_before` as a cost estimate in
-addition to input-token count.
+If a request cannot fit in a batch with other work, the scheduler may defer it. If the request cannot make progress
+even as the only item under the configured limits, it is individually unrunnable. `schedule` removes that request from
+the active set, releases its cache handle, and includes `FinishedEvent(reason="unrunnable")` in `ScheduleResult.events`.
+This check is made against the next required operation, so a request can become unrunnable during decoding. The
+scheduler may continue planning other requests in the same call.
 
+If runnable work remains, `schedule` calls `prepare_batch` and returns the fully executable batch in
+`ScheduleResult.batch`. If no work can run, `batch` is `None`; `events` may still contain terminal events. Both fields
+may be populated in one result. Calling `schedule` while a previous batch is in flight is an error.
+
+The batch selection policy is internal to `schedule`. It must cap a single request's prefill chunk and use spare batch
+capacity for other fitting work. Each running request that is eligible for work but omitted from a batch accrues one
+batch bypass. Once it reaches `max_batch_bypasses`, the scheduler must prioritize it in the next batch where its next
+operation can fit. This bounds scheduling opportunities, not wall-clock time. The scheduler must distinguish this
+temporary batch pressure from an operation that cannot fit even by itself; only the latter is unrunnable. A one-token
+decode can still be expensive when it reads a long KV history, so selection may use `context_length_before` as a cost
+estimate in addition to input-token count.
+
+<a id="scheduler-complete"></a>
 ### `complete(batch, output) -> list[Event]`
 
 Verifies that output corresponds to the in-flight batch, commits its KV writes, advances each request's prefill cursor
@@ -144,6 +213,7 @@ and `max_new_tokens` limits, queues `TokenEvent` objects for sampled non-stop to
 request's blocks and reservation before returning its `FinishedEvent`. Partial prefills produce no token event. The
 returned events are handed to the service layer for streaming.
 
+<a id="scheduler-fail"></a>
 ### `fail(batch, error) -> list[Event]`
 
 Handles an exception from the model runner. It aborts uncommitted KV allocations, terminates the affected requests with
@@ -162,6 +232,7 @@ class KVCacheManager:
     def release(self, handle: CacheHandle) -> None: ...
 ```
 
+<a id="kv-estimate-reservation"></a>
 ### `estimate_reservation(request) -> int`
 
 Returns the maximum KV block charge for the request, including block rounding and copy-on-write requirements. V1 may
@@ -169,12 +240,14 @@ conservatively calculate from `len(prompt_token_ids) + max_new_tokens`, even tho
 outside KV. The calculation must be safe when prefix sharing is absent; prefix-cache savings can be added later without
 weakening the guarantee.
 
+<a id="kv-try-reserve"></a>
 ### `try_reserve(request_id, blocks) -> CacheHandle | None`
 
 Atomically reserves `blocks` for an admitted request. Returns an opaque handle on success or `None` when other running
 requests currently hold too much capacity. A request that can never fit is rejected by `add_request`, rather than left
 waiting forever.
 
+<a id="kv-prepare-batch"></a>
 ### `prepare_batch(items) -> KVBatchLayout`
 
 Allocates the physical slots needed for all new KV writes in the proposed batch and returns the corresponding block
@@ -182,16 +255,19 @@ tables, write-slot mappings, and context metadata. Preparation is atomic. With v
 batch limits, it must succeed; a capacity failure indicates an accounting or planning error, not a routine signal to
 shrink the batch.
 
+<a id="kv-commit-batch"></a>
 ### `commit_batch(layout) -> None`
 
 Marks a successfully executed batch's KV writes and sequence lengths as committed. Only a committed batch can supply
 history to a later batch.
 
+<a id="kv-abort-batch"></a>
 ### `abort_batch(layout) -> None`
 
 Discards that batch's uncommitted allocations after runner failure and restores the last committed logical KV state.
 Slots written during a failed run must not be exposed as valid history.
 
+<a id="kv-release"></a>
 ### `release(handle) -> None`
 
 Frees the request's physical KV blocks and remaining reservation. The scheduler calls it on completion, cancellation, or
@@ -214,16 +290,53 @@ admission, or release a request's KV resources.
 ```python
 scheduler.add_request(tokenized_request)  # service layer, once per request
 
-batch = scheduler.schedule()
-if batch is not None:
+result = scheduler.schedule()
+service.publish(result.events)
+if result.batch is not None:
     try:
-        output = model_runner.run(batch)
+        output = model_runner.run(result.batch)
     except Exception as error:
-        events = scheduler.fail(batch, error)
+        events = scheduler.fail(result.batch, error)
     else:
-        events = scheduler.complete(batch, output)
+        events = scheduler.complete(result.batch, output)
     service.publish(events)
 ```
 
 `complete` releases finished requests before `service.publish` runs. The next `schedule` call can therefore admit
 waiting requests using the newly freed KV capacity.
+
+## Service-facing asynchronous API
+
+The service-facing mental model is a long-lived scheduler that accepts requests, owns the scheduling loop, and
+delivers token and finish events back to the service. The service does not call `schedule`, `complete`, or `fail`
+directly. Those operations remain internal scheduler steps. This section describes the intended boundary; exact
+transport and shutdown semantics remain open design choices.
+
+```python
+class Scheduler:
+    async def submit(self, request: TokenizedRequest) -> RequestStream: ...
+    async def cancel(self, request_id: RequestId) -> None: ...
+    async def run(self) -> None: ...
+
+class ModelRunner:
+    async def run(self, batch: ReadyBatch) -> RunnerOutput: ...
+
+async def serve_request(scheduler: Scheduler, request: TokenizedRequest) -> None:
+    events = await scheduler.submit(request)
+    async for event in events:
+        await service.publish(event)
+```
+
+`submit` makes the request available to the scheduler and returns a per-request stream. The scheduler's run loop admits
+waiting requests, creates batches, awaits the model runner, commits or aborts KV work, and publishes resulting events
+to the matching streams. A stream yields `TokenEvent`s in that request's token order and ends with exactly one
+`FinishedEvent`. A scheduler failure or shutdown must also terminate open streams with a defined outcome.
+
+Cancellation must be safe while the scheduler is planning or awaiting the runner. A request in an in-flight batch is
+marked for cancellation and cleaned up after the runner returns; its stream then receives one cancellation finish
+event. The implementation must define whether the runner call is awaited serially or can overlap with other work;
+the current invariant remains one model batch in flight at a time.
+
+This public async API is separate from the internal scheduling functions shown above. The current draft still needs to
+reconcile their signatures and define `RequestStream`, stream backpressure, duplicate IDs, scheduler startup and
+shutdown, and errors delivered after submission.
