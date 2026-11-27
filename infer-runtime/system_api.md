@@ -16,8 +16,7 @@ not implement them.
   - [`complete`](#scheduler-complete)
   - [`fail`](#scheduler-fail)
 - [KV cache manager API](#kv-cache-manager-api-used-by-the-scheduler)
-  - [`estimate_reservation`](#kv-estimate-reservation)
-  - [`try_reserve`](#kv-try-reserve)
+  - [`estimate_additional_blocks`](#kv-estimate-additional-blocks)
   - [`prepare_batch`](#kv-prepare-batch)
   - [`commit_batch`](#kv-commit-batch)
   - [`abort_batch`](#kv-abort-batch)
@@ -31,14 +30,10 @@ not implement them.
 The scheduler owns a waiting queue and a running pool. Each running request is in exactly one phase: `PREFILL` or
 `DECODE`. There is one model batch in flight at a time. Normal scheduling does not preempt running requests.
 
-Admission and batch planning have different memory checks:
-
-1. **Admission:** Before moving a waiting request to the running pool, reserve enough KV capacity for its entire
-   possible run. This lets the request finish without later KV preemption. A request can be admitted whenever capacity
-   is available, including capacity left unused by current requests or freed by a completed request.
-2. **Batch planning:** Select work that fits the per-forward-pass token, sequence, and execution-workspace limits.
-   Allocate physical slots for every KV write before giving the plan to the model runner. A valid KV reservation
-   guarantees that these slots can be allocated.
+The scheduler selects candidate work from waiting and running requests before asking the KV manager to prepare it.
+The manager confirms and allocates slots for the selected batch's KV writes. It does not reserve the request's entire
+possible generation when the request enters the running pool. A request may remain active between batches while its
+future KV writes are not yet allocated.
 
 The KV block pool is sized after model weights and a worst-case execution workspace for the configured batch limits have
 been accounted for. The runner and scheduler must validate those limits together at initialization; otherwise token and
@@ -178,13 +173,16 @@ The method returns any `FinishedEvent(reason="cancelled")` ready now; an in-flig
 <a id="scheduler-schedule"></a>
 ### `schedule() -> ScheduleResult`
 
-Scans waiting requests and calls `try_reserve` for requests that can fit; each admitted request moves to the running
-pool with `phase=PREFILL`; this is a request state, not a separate prefill pool. A request skipped because capacity
-is temporarily unavailable accrues one admission bypass for
-that scheduling call. Once it reaches `max_admission_bypasses`, the scheduler must not admit newer requests ahead of
-it until it is admitted or terminates. This bounds bypasses, not wall-clock time: wall-clock latency also depends on
-batch execution time and resource release. It then plans prefill chunks and decode steps within `SchedulerConfig`;
-these limits must have been validated against the runner's worst-case execution workspace at initialization.
+Considers candidate work from both the waiting queue and running pool, applying the admission and batch fairness
+policies. Waiting requests selected for a candidate batch enter the running pool with `phase=PREFILL`; this is a
+request state, not a separate prefill pool. A request skipped because capacity or batch limits prevent its selection
+accrues the corresponding bypass count. Once it reaches the configured bound, the scheduler must prioritize it when
+it can be admitted and its next operation can fit. This bounds scheduling opportunities, not wall-clock time.
+
+The scheduler selects candidate prefill chunks and decode steps within `SchedulerConfig`; these limits must have been
+validated against the runner's worst-case execution workspace at initialization. It then asks the KV manager to
+prepare the selected candidate batch. If preparation returns `None`, it may reduce or change the candidate batch and
+try again. It must not treat a failed combined batch preparation as proof that each included request is unrunnable.
 
 If a request cannot fit in a batch with other work, the scheduler may defer it. If the request cannot make progress
 even as the only item under the configured limits, it is individually unrunnable. `schedule` removes that request from
@@ -224,36 +222,34 @@ not normal preemption.
 
 ```python
 class KVCacheManager:
-    def estimate_reservation(self, request: TokenizedRequest) -> int: ...
-    def try_reserve(self, request_id: RequestId, blocks: int) -> CacheHandle | None: ...
-    def prepare_batch(self, items: tuple[BatchItem, ...]) -> KVBatchLayout: ...
+    def estimate_additional_blocks(self, handle: CacheHandle, item: BatchItem) -> int: ...
+    def prepare_batch(self, items: tuple[BatchItem, ...]) -> KVBatchLayout | None: ...
     def commit_batch(self, layout: KVBatchLayout) -> None: ...
     def abort_batch(self, layout: KVBatchLayout) -> None: ...
     def release(self, handle: CacheHandle) -> None: ...
 ```
 
 <a id="kv-estimate-reservation"></a>
-### `estimate_reservation(request) -> int`
+<a id="kv-estimate-additional-blocks"></a>
+### `estimate_additional_blocks(handle, item) -> int`
 
-Returns the maximum KV block charge for the request, including block rounding and copy-on-write requirements. V1 may
-conservatively calculate from `len(prompt_token_ids) + max_new_tokens`, even though the final sampled token may remain
-outside KV. The calculation must be safe when prefix sharing is absent; prefix-cache savings can be added later without
-weakening the guarantee.
-
-<a id="kv-try-reserve"></a>
-### `try_reserve(request_id, blocks) -> CacheHandle | None`
-
-Atomically reserves `blocks` for an admitted request. Returns an opaque handle on success or `None` when other running
-requests currently hold too much capacity. A request that can never fit is rejected by `add_request`, rather than left
-waiting forever.
+Returns the number of additional KV blocks needed to prepare this item's writes for the given cache handle. The
+estimate includes block rounding and copy-on-write requirements, and is measured in physical KV blocks. The scheduler
+uses it to detect an item that cannot fit even when considered alone: if its requirement exceeds the manager's total
+pool capacity, the item is unrunnable. A requirement that fits the total pool but exceeds current free capacity is
+temporary pressure and must not by itself terminate the request. This estimate is advisory; `prepare_batch` remains
+the atomic allocation check.
 
 <a id="kv-prepare-batch"></a>
-### `prepare_batch(items) -> KVBatchLayout`
+### `prepare_batch(items) -> KVBatchLayout | None`
 
-Allocates the physical slots needed for all new KV writes in the proposed batch and returns the corresponding block
-tables, write-slot mappings, and context metadata. Preparation is atomic. With valid reservations and a plan within the
-batch limits, it must succeed; a capacity failure indicates an accounting or planning error, not a routine signal to
-shrink the batch.
+After the scheduler selects candidate work, atomically allocates the physical slots needed for all KV writes in that
+batch and returns the corresponding block tables, write-slot mappings, and context metadata. Returns `None` if the
+selected batch cannot be prepared with currently available KV capacity; no partial allocation is retained. The
+scheduler may then choose a smaller candidate batch. If even one request's next operation cannot be prepared alone,
+the scheduler marks that request `unrunnable`; capacity pressure caused by combining requests is temporary and must not
+terminate them. The manager's decision confirms KV capacity only; the scheduler remains responsible for batch token,
+sequence, and runner-workspace limits.
 
 <a id="kv-commit-batch"></a>
 ### `commit_batch(layout) -> None`
@@ -270,8 +266,7 @@ Slots written during a failed run must not be exposed as valid history.
 <a id="kv-release"></a>
 ### `release(handle) -> None`
 
-Frees the request's physical KV blocks and remaining reservation. The scheduler calls it on completion, cancellation, or
-failure.
+Frees the request's physical KV blocks. The scheduler calls it on completion, cancellation, or failure.
 
 ## Model runner API used by the scheduler
 
